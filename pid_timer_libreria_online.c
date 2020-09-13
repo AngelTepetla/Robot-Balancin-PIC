@@ -1,219 +1,156 @@
 
 #include <18F4550.h>
+#include <math.h>
+#include "constantes.h"
 
-#build(reset=0x02000,interrupt=0x02008)
-#org 0x0000,0x1FFF {}
-// cristal de 8Mhz, CPU a 48M
-#fuses HSPLL, PLL2, CPUDIV1, NOWDT, NOPROTECT, NOLVP, NODEBUG, NOVREGEN, USBDIV
-#use delay(clock = 48000000)  
+// ----------------------------  REMAPEO PARA BOOTLOADER  ------------------------------
+#build(reset=0x02000, interrupt=0x02008)
+#org 0x0000, 0x1FFF {}
 // -------------------------------------------------------------------------------------
 
+#fuses HSPLL, NOWDT, NOPROTECT, NOLVP, NODEBUG, USBDIV, PLL5, CPUDIV1, VREGEN
+#use delay(clock = 48000000)
 
 // ---------------------------------  MODULO LCD I2C  ----------------------------------
-#define MPU_SDA PIN_B0                             
-#define MPU_SCL PIN_B1        
-#use I2C(master, sda=MPU_SDA, scl=MPU_SCL, Fast) 
-// ---------------------------------------------------------------------------------------
-
-// cambiar el baudrate segun sea necesario
-#use rs232(STREAM=UART, baud = 115200, parity = N, xmit = PIN_C6, rcv = PIN_C7, bits = 8, stop = 1)   //Comunicación serial a 9600bps, 1 bit de paro, sin paridad
-
-#include <math.h>
+#use I2C(master, sda = MPU_SDA, scl = MPU_SCL, Fast) 
 #include "MPU6050.c"
+// -----------------------------------    TIMER 1   ------------------------------------
+#use TIMER(TIMER = 1, TICK = 500us, BITS = 16, NOISR)  
 
-// 180/PI
-#define A_DEG 57.2957
-#define A_RAD 0.0174532
-#define REBOTE 250
-
-
-//520
-#define MINIMA_MOTOR 0
-#define MAXIMA_MOTOR 597 // (PPR2 + 1) * 4
-#define LIMITE_INTEGRAL 400
+// -----------------------------------    SERIAL    ------------------------------------
+#use RS232(STREAM = UART, baud = 115200, parity = N, xmit = PIN_C6, rcv = PIN_C7, bits = 8, stop = 1)   //ComunicaciÃ³n serial a 9600bps, 1 bit de paro, sin paridad
 
 
-#define GYRO_SCALE 131.0 // lsb / (degrees / second)
-#define PERIODO_LECTURA 20
+// ----------------------------------    G_PID    -----------------------------------
+// Factor es numero entre 0 y 1, para restringir la 'velocidad' maxima de los motores
+// Minima_Motor es el valor PWM donde apenas y se activan los motores
+// Setpoint es el angulo deseado respecto al suelo, idealmente debe ser 0, depende de si el balancin naturalmente se inclina hacia cierto lado
+volatile float Kp = 88, Ki = 53, Kd = 0.65, Factor = 0.85, Setpoint = 6.50;
+signed long Minima_Motor = 300;
 
-// fc = 2Hz
-#define FILTRO_C1 0.92
-#define FILTRO_C2 0.08
 
+// --------------------------------    GYRO/ACC    ----------------------------------
+signed long OFFSETGY = 13; // offset del giroscopio, se obtiene de manera externa
 
 volatile float angX;
-unsigned int8 accX_H, accZ_H, accX_L, accZ_L, giroY_H, giroY_L;
-signed int16 accX, accZ, giroG;
-
-float giroY;
-volatile float inclinacion_acc;
-volatile float inclinacion = 0, inclinacion_old = 0, inclinacion_anterior;
-
-// offset del giroscopio, se obtiene de manera externa
-signed int16 OFFSETGY = 13;
+int8 accX_H, accZ_H, accX_L, accZ_L, giroY_H, giroY_L;
+signed long accX, accZ, giroG;
 
 
-volatile double integral, I = 0;
-volatile float error, derivada, error_anterior = 0;
-volatile float velo = 0;
+// -----------------------------------    PID    ------------------------------------
+volatile double Integral, I = 0;
+volatile float Error, Error_anterior = 0, Derivada;
 
+volatile float P = 0, D = 0, Angulo_X = 0;
+volatile float Inclinacion_Actual = 0, Inclinacion_Anterior = 0;
+volatile signed long Salida = 0;
 
-volatile float P = 0, D = 0, auxx = 0, timing = 0;
-volatile signed int16 salida = 0;
-
-
-// variables a modificar para el PID
-volatile float kp = 88, ki = 53, kd = 0.65, factor = 0.85, setpoint = 6.50;
-volatile int16 min_motor = 300;
-// factor es numero entre 0 y 1, para restringir la 'velocidad' maxima de los motores
-// min_motor es el valor PWM donde apenas y se activan los motores
-
-
-volatile float angle = 0;
 
 char stringy[30];
 char recibe = 0;
 
-//
 // Estructura:  [identificador][decena][unidad][.][decima][centesima]
-//      para cambiar Kd:     p12.34        kd = 12.34
-//                   ki:     i00.34        ki = 0.34
+// ejemplo:                   p45.12
+//      para cambiar Kd:     p12.34        Kd = 12.34
+//                   Ki:     i00.34        Ki = 0.34
 // no almacena nada en eeprom
-#int_rda
-void serial_isr(){
 
-   //signed long ausy = 0;
-   gets(stringy);                      // Obtenemos dato desde buffer USART...
-   //ausy = atol(stringy);
+#int_rda
+void serial_isr()
+{
+   gets(stringy);                      // Obtenemos dato desde buffer USART...   
    
-   recibe = stringy[0];
+
    delay_ms(100);
    
-   int8 a1, b1, c1, d1;
-   int16 DD = 0, UU = 0, uu1 = 0, dd1 = 0;
-   int16 auxU = 0;
-   
+   int8_t a1, b1, c1, d1;
+   signed long DD = 0, UU = 0, uu1 = 0, dd1 = 0;
+   signed long auxU = 0;
+
+   recibe = stringy[0];
    a1 = stringy[1];
    b1 = stringy[2];
+   // stringy 3 es el punto decimal (XX.XX)
    c1 = stringy[4];
    d1 = stringy[5];
-   
-   
-   
-   switch(recibe){
-      
+
+   delay_ms(1);
+   DD = a1 - OFFSET_ASCII;
+   UU = b1 - OFFSET_ASCII;  // stringy 3 es el punto decimal  p45.00
+   uu1 = c1 - OFFSET_ASCII;
+   dd1 = d1 - OFFSET_ASCII;
+   auxU = (DD * 1000) + (UU * 100) + (uu1 * 10) + dd1;
+
+   switch(recibe)
+   {
       case 'p':
-     
-         DD = a1 -48;
-         UU = b1 -48;  // stringy 3 es el punto decimal  p45.00
-         //   punto   ......   //
-         uu1 = c1 -48;
-         dd1 = d1 -48;
+         Kp = (float) auxU; 
+         Kp = Kp / 10;
          
-         auxU = (DD * 1000) + (UU * 100) + (uu1 * 10) + dd1;
-         kp = (float)auxU; 
-         kp = kp / 10;
-         
-         printf("\nNueva Kp: %2.2f (DD_UU_._uu_dd / 10) \n", kp);
+         printf("\nNueva Kp: %2.2f\n", Kp);
          break;         
       
-      
       case 'i':
-             
-         DD = a1 -48;
-         UU = b1 -48;  // stringy 3 es el punto decimal  p45.00
-         //   punto   ......   //
-         uu1 = c1 -48;
-         dd1 = d1 -48;
+         Ki = (float) auxU; 
+         Ki = Ki / 100;
          
-         auxU = (DD * 1000) + (UU * 100) + (uu1 * 10) + dd1;
-         ki = (float)auxU; 
-         ki = ki / 100;
-         
-         printf("\nNueva Ki: %2.2f\n", ki);
+         printf("\nNueva Ki: %2.2f\n", Ki);
          break;
       
       case 'd':
+         Kd = (float) auxU; 
+         Kd = Kd / 100;
          
-         DD = a1 -48;
-         UU = b1 -48;  // stringy 3 es el punto decimal  p45.00
-         //   punto   ......   //
-         uu1 = c1 -48;
-         dd1 = d1 -48;
-         
-         auxU = (DD * 1000) + (UU * 100) + (uu1 * 10) + dd1;
-         kd = (float)auxU; 
-         kd = kd / 100;
-         
-         printf("\nNueva Kd: %2.2f\n", kd);
+         printf("\nNueva Kd: %2.2f\n", Kd);
          break;
          
       case 'f':
+         Factor = (float)(auxU);
+         Factor = Factor / 100;
          
-         DD = a1 -48;
-         UU = b1 -48;  // stringy 3 es el punto decimal  p45.00
-         //   punto   ......   //
-         uu1 = c1 -48;
-         dd1 = d1 -48;
-         
-         auxU = (DD * 1000) + (UU * 100) + (uu1 * 10) + dd1;
-         factor = (float)(auxU);
-         factor = factor / 100;
-         
-         printf("\nNuevo factor: %2.2f\n", factor);
+         printf("\nNuevo Factor: %2.2f\n", Factor);
          break;
          
       case 'm':
-     
-         DD = a1 -48;
-         UU = b1 -48;  // stringy 3 es el punto decimal  p45.00
-         uu1 = c1 -48;
-         dd1 = d1 -48;
-         
          auxU = (DD * 1000) + (UU * 100) + (uu1 * 10) + dd1;
-         min_motor = auxU;
+         Minima_Motor = auxU;
          
-         printf("\nNueva minima motor: %ld\n", min_motor);
+         printf("\nNueva minima motor: %ld\n", Minima_Motor);
          break;
       
       case 's':
-     
-         DD = a1 -48;
-         UU = b1 -48;  // stringy 3 es el punto decimal  p45.00
-         //   punto   ......   //
-         uu1 = c1 -48;
-         dd1 = d1 -48;
-         
          auxU = (UU * 100) + (uu1 * 10) + dd1;
-         setpoint = (float)auxU;
-         setpoint = setpoint / 10;
+
+         Setpoint = (float) auxU;
+         Setpoint = Setpoint / 10;
          
-         if(DD == 1){
-            setpoint = -setpoint;
+         if(DD == 1)
+         {
+            Setpoint = -Setpoint;
          }
-         else{
-            //setpoint = setpoint;
+         else
+         {
+            //Setpoint = Setpoint;
          }
          
-         printf("\nNuevo setpoint: %2.2f (offset 00 | 1-, 0+)\n", setpoint);
+         printf("\nNuevo Setpoint: %2.2f (offset 00 | 1-, 0+)\n", Setpoint);
          break;         
       
-      
       case 'e':
-         printf("\n\nSP: %f angulo: %f error: %f P: %f I: %f D: %f salida: %ld auxx: %4.2f\n", setpoint, angX, error, P, I, D, salida, auxx);
-         printf("min_motor: %ld \n", min_motor);
+         printf("\n\nSP: %f angulo: %f Error: %f P: %f I: %f D: %f Salida: %ld\n", Setpoint, angX, Error, P, I, D, Salida);
+         printf("Minima_Motor: %ld \n", Minima_Motor);
          break;
       
       case 'c':
-         printf("\nerror: %f P: %f I: %f D: %f salida: %ld int: %f der: %f timing: %f \n", error, P, I, D, salida, integral, derivada, timing);
+         printf("\nError: %f P: %f I: %f D: %f Salida: %ld int: %f der: %f\n", Error, P, I, D, Salida, Integral, Derivada);
          break;
          
       case 'r':
-         integral = 0;
-         derivada = 0;
-         error = 0;
+         Integral = 0;
+         Derivada = 0;
+         Error = 0;
          
-         printf("\nReset variables integral, derivada, error \n");
+         printf("\nReset variables Integral, Derivada, Error\n");
          break;
   
       default:
@@ -223,15 +160,16 @@ void serial_isr(){
    } // switch
       
   
-  printf("%3.2f %3.2f %3.2f \n", kp, ki, kd);
-  
-  clear_interrupt(INT_RDA);      // clears the timer0 interrupt flag
-
-
+  printf("%3.2f %3.2f %3.2f \n", Kp, Ki, Kd);
+  clear_interrupt(INT_RDA);      // clears the interrupt flag
 }
 
-float angular(void){
-   
+
+float Leer_Angulo(void)
+{
+   float inclinacion_acelerometro;
+   float inclinacion_giroscopio;
+
    accX_H = Mpu6050_Read(MPU6050_RA_ACCEL_XOUT_H);
    accZ_H = Mpu6050_Read(MPU6050_RA_ACCEL_ZOUT_H);
    giroY_H = Mpu6050_Read(MPU6050_RA_GYRO_YOUT_H);
@@ -243,127 +181,120 @@ float angular(void){
    accX = make16(accX_H, accX_L);
    accZ = make16(accZ_H, accZ_L);
    giroG = make16(giroY_H, giroY_L);
-                 
-   giroY = (float) (giroG / -GYRO_SCALE);
 
-   inclinacion_acc = (atan2(accX, accZ)+PI) * A_DEG; // angulo de inclinacion del acelerometro
-   inclinacion_old = FILTRO_C1 * ( inclinacion_old + giroY * 0.0218) + (FILTRO_C2 * inclinacion_acc);
-   angX = inclinacion_old -180; // angulo
-   
+   inclinacion_acelerometro = ( atan2(accX, accZ) + PI ) * A_DEG; // angulo de inclinacion del acelerometro
+   inclinacion_giroscopio = (float) (giroG / -GYRO_SCALE); // angulo de inclinacion del giroscopio
+
+   Inclinacion_Actual = FILTRO_C1 * ( Inclinacion_Actual + inclinacion_giroscopio * 0.0218) + (FILTRO_C2 * inclinacion_acelerometro); // filtro complementario
+
+   angX = Inclinacion_Actual - 180; // angulo sobre el eje X
    return angX;
 }
 
-// Control motores
-void motores(signed int16 velo, int16 minimaMotor, float angulo){
 
-   int direccion = 1;
-   int16 velocidad;
-   char dir = ' ';
+void Control_Motores(signed long salida, signed long velocidad_minima, float angulo)
+{
+   signed long vdelocidad = velocidad_minima;
+   float velocidad_escalada = 0;
     
-   if(velo < 0){
-      direccion = 2;
-      
-      signed int16 compa = minimaMotor * -1;
-      if(velo < compa ){
-         velocidad = -1 * velo;
-      }
-      else{
-         velocidad = minimaMotor;
-      }
-      dir = 'R';
+   if(salida < 0)  // si la salida es negativa, se hace cambio de direccion
+   {
+      salida = -1 * salida;  // se elimina el signo negativo
       output_low(PIN_B5);
       output_high(PIN_B6);
-
    }
-   
-   else{
-   
-      if(velo > minimaMotor){
-         velocidad = velo;
-      }
-      else{
-         velocidad = minimaMotor;
-      }
-      
-      dir = 'L';
+   else
+   {
       output_low(PIN_B6);
       output_high(PIN_B5);
-      
    }
-   
-   if(angulo > 45 || angulo < -45){
-      velocidad = 0;
-      set_pwm2_duty(0);
+
+   if(salida > velocidad_minima )
+   {
+      vdelocidad = salida;
    }
-   else{
-      auxx = (float)(velocidad);
-      auxx = auxx * factor;
-      velocidad = (int16)(auxx);
-      set_pwm2_duty(velocidad);   
+
+   if(angulo > 45 || angulo < -45) // si el balancin se cae, se apagan los motores
+   {
+      vdelocidad = 0;
    }
-   
+   else
+   {
+      velocidad_escalada = (float)(vdelocidad); // se escala la valocidad maxima, segun el Factor (0 a 100%)
+      velocidad_escalada = velocidad_escalada * Factor; // **esto podria no ser necesario
+      vdelocidad = (signed long)(velocidad_escalada);  
+   }
+   set_pwm2_duty(vdelocidad);
 } // funcion motores
 
-// PID YO 25/07/19 14:21
-void PID(float anguloIn, int16 valor_timer){
-   
-   float timing = (float)(valor_timer * 0.001);
+
+void PID(float angulo_entrada, unsigned long valor_timer)
+{
+   float segundos_transcurridos;
+   segundos_transcurridos = (float)(valor_timer * 0.001);
    
    // calcula valores para el PID
-   error = setpoint - anguloIn;
-   derivada = (anguloIn - inclinacion_anterior) / timing;
-   integral = integral + (error * ki * timing);
+   Error = Setpoint - angulo_entrada;
+   Derivada = (angulo_entrada - Inclinacion_Anterior) / segundos_transcurridos;
+   Integral = Integral + (Error * Ki * segundos_transcurridos);
    
    /*
-   if(error > 1.0){
-      integral = 0;
+   if(Error > 1.0)
+   {
+      Integral = 0;
    }
    */
    
-   if(integral > MAXIMA_MOTOR){  integral = MAXIMA_MOTOR;  }
-   else if( integral < -MAXIMA_MOTOR){  integral = -MAXIMA_MOTOR;  }
-      
-   // Calcula PID
-   P = error * kp;
-   I = integral;
-   D = derivada * kd;
-      
-   salida = (int16) ( P + I - D);
-   //salida = (int16) ( kp * error + integral + kd * derivada );
-   if (salida > MAXIMA_MOTOR){
-      salida = MAXIMA_MOTOR;
+   if( Integral > D_MAXIMA_MOTOR )
+   {
+      Integral = D_MAXIMA_MOTOR;
    }
-   else if (salida < -MAXIMA_MOTOR){
-      salida = -MAXIMA_MOTOR;
+   else if( Integral < -D_MAXIMA_MOTOR )
+   {
+      Integral = -D_MAXIMA_MOTOR;
+   }
+      
+   P = Error * Kp;
+   I = Integral;
+   D = Derivada * Kd;
+      
+   Salida = (unsigned long) ( P + I - D);
+   
+   if (Salida > D_MAXIMA_MOTOR)
+   {
+      Salida = D_MAXIMA_MOTOR;
+   }
+   else if (Salida < -D_MAXIMA_MOTOR)
+   {
+      Salida = -D_MAXIMA_MOTOR;
    }
      
-   // Pone el valor de la salida, en los motores
-   motores(salida, min_motor, anguloIn);
-   error_anterior = error;
-   inclinacion_anterior = anguloIn;
+   // Pone el valor de la Salida, en los motores
+   Control_Motores(Salida, Minima_Motor, angulo_entrada);
+   Error_anterior = Error;
+   Inclinacion_Anterior = angulo_entrada;
         
-} // funcion PID
+}
 
 
 #int_timer0 
-void TIMER0_isr(void){
-
-   // lee el angulo de inclinacion
-   angle = angular();
+void TIMER0_isr(void)
+{
+   Angulo_X = Leer_Angulo(); // lee el angulo de inclinacion
    
    // llama a la funcion de calculo de PID, y activa los motores
-   PID(angle, 22); // 21.8ms overflow
-   
-   
+   PID(Angulo_X, 22); // 21.8ms overflow 
 } 
 
 
-void main(void){ 
+void main(void)
+{ 
+   int8_t x = 0;
+   int8_t byte_alto = 0, byte_bajo = 0;
 
    set_tris_a(0xFF);
-   set_tris_b(0b11101110);         //Configura puerto B  1= entrada  0= salida
+   set_tris_b(0b11101110);         //Configura puerto B  1= entrada  0= Salida
    set_tris_c(0xBF);                      // Configuramos puerto c (PINES DE COMUNICACION SERIAL Y PIN DE ENTRADA BOTON EN RC2)
-   
    
    setup_timer_0(RTCC_INTERNAL|RTCC_DIV_4);      //21,8 ms overflow // tiempo de muestreo de 21.8ms, casi 22
    setup_timer_2(T2_DIV_BY_16, 149, 1);      //200 us overflow, 200 us interrupt, PWM 5Khz
@@ -375,32 +306,30 @@ void main(void){
    enable_interrupts(INT_RDA);
    enable_interrupts(GLOBAL);
  
-   
+   // capacitor ceramico de 0.1uF, puente H, a 12V capacitor de almenos 470uF
    delay_ms(100);
    Mpu6050_Init();
-      
-   int8 x;
+
    x = Mpu6050_Read(MPU6050_RA_WHO_AM_I);
-                                                       
-   if(x != 0x68){
-      //printf ("\nConnection ERR!!!");
+   byte_alto = OFFSETGY >> 8;
+   byte_bajo = OFFSETGY & 255;
+                                                    
+   if(x != 0x68)
+   {
+      //printf ("\nMPU Conexion Error!");
       return;
-   } // capacitor ceramico de 0.1uF, puente H, a 12V capacitor de almenos 470uF
+   } 
    
-   int8 primero = 0, segundo = 0;
-   
-   primero = OFFSETGY >> 8;
-   segundo = OFFSETGY & 255;
    // offset giroscopio Y
-   Mpu6050_Write(0x15, primero);  // offset gyH
-   Mpu6050_Write(0x16, segundo);  // offset gyL
+   Mpu6050_Write(0x15, byte_alto);  // offset gyH
+   Mpu6050_Write(0x16, byte_bajo);  // offset gyL
    
    printf("\nArranca! \n");
 
-   while( 1 ) { 
-
+   while( 1 ) 
+   { 
+      //
    } 
   
-
   
 } // main  
